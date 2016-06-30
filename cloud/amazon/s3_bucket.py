@@ -103,14 +103,12 @@ EXAMPLES = '''
     tags:
       example: tag1
       another: tag2
-    
+
 '''
 
 import xml.etree.ElementTree as ET
 import urlparse
-
-from ansible.module_utils.basic import *
-from ansible.module_utils.ec2 import *
+import re
 
 try:
     import boto.ec2
@@ -122,12 +120,12 @@ except ImportError:
     HAS_BOTO = False
 
 def get_request_payment_status(bucket):
-    
+
     response = bucket.get_request_payment()
     root = ET.fromstring(response)
     for message in root.findall('.//{http://s3.amazonaws.com/doc/2006-03-01/}Payer'):
         payer = message.text
-    
+
     if payer == "BucketOwner":
         return False
     else:
@@ -143,6 +141,26 @@ def create_tags_container(tags):
     tags_obj.add_tag_set(tag_set)
     return tags_obj
 
+def cors_xml_to_dict(xmlstring):
+    """ Convert CORS XML string to JSON """
+
+    # Remove namespace to make parsing easier
+    root = ET.fromstring(re.sub(' xmlns="[^"]+"', '', xmlstring, count=1))
+
+    xml_dict = []
+    for corsrule in root.findall('CORSRule'):
+        rules = {}
+        for xml_tag in ['AllowedOrigin', 'AllowedMethod', 'AllowedHeader', 'ExposeHeader']:
+            tags = []
+            for tag in corsrule.findall(xml_tag):
+                tags.append(tag.text)
+            rules[xml_tag.lower()] = tags
+
+        rules['MaxAgeSeconds'.lower()] = corsrule.find('MaxAgeSeconds').text
+        xml_dict.append(rules)
+
+    return xml_dict
+
 def _create_bucket(connection, module, location):
 
     policy = module.params.get("policy")
@@ -151,7 +169,7 @@ def _create_bucket(connection, module, location):
     tags = module.params.get("tags")
     versioning = module.params.get("versioning")
     changed = False
-    
+
     try:
         bucket = connection.get_bucket(name)
     except S3ResponseError as e:
@@ -160,7 +178,7 @@ def _create_bucket(connection, module, location):
             changed = True
         except S3CreateError as e:
             module.fail_json(msg=e.message)
-    
+
     # Versioning
     versioning_status = bucket.get_versioning_status()
     if not versioning_status and versioning:
@@ -182,7 +200,7 @@ def _create_bucket(connection, module, location):
             bucket.configure_versioning(versioning)
             changed = True
             versioning_status = bucket.get_versioning_status()
-    
+
     # Requester pays
     requester_pays_status = get_request_payment_status(bucket)
     if requester_pays_status != requester_pays:
@@ -195,7 +213,7 @@ def _create_bucket(connection, module, location):
             changed = True
             requester_pays_status = get_request_payment_status(bucket)
 
-    # Policy        
+    # Policy
     try:
         current_policy = bucket.get_policy()
     except S3ResponseError as e:
@@ -203,11 +221,11 @@ def _create_bucket(connection, module, location):
             current_policy = None
         else:
             module.fail_json(msg=e.message)
-    
+
     if current_policy is not None and policy is not None:
         if policy is not None:
             policy = json.dumps(policy)
-            
+
         if json.loads(current_policy) != json.loads(policy):
             try:
                 bucket.set_policy(policy)
@@ -218,14 +236,14 @@ def _create_bucket(connection, module, location):
 
     elif current_policy is None and policy is not None:
         policy = json.dumps(policy)
-            
+
         try:
             bucket.set_policy(policy)
             changed = True
             current_policy = bucket.get_policy()
         except S3ResponseError as e:
             module.fail_json(msg=e.message)
-    
+
     elif current_policy is not None and policy is None:
         try:
             bucket.delete_policy()
@@ -236,11 +254,11 @@ def _create_bucket(connection, module, location):
                 current_policy = None
             else:
                 module.fail_json(msg=e.message)
-            
+
     ####
     ## Fix up json of policy so it's not escaped
     ####
-    
+
     # Tags
     try:
         current_tags = bucket.get_tags()
@@ -250,9 +268,9 @@ def _create_bucket(connection, module, location):
             current_tags = None
         else:
             module.fail_json(msg=e.message)
-    
+
     if current_tags is not None or tags is not None:
-       
+
         if current_tags is None:
             current_tags_dict = {}
         else:
@@ -269,14 +287,30 @@ def _create_bucket(connection, module, location):
             except S3ResponseError as e:
                 module.fail_json(msg=e.message)
 
-    module.exit_json(changed=changed, name=bucket.name, versioning=versioning_status, requester_pays=requester_pays_status, policy=current_policy, tags=current_tags_dict)
-    
+    # CORS rules
+    cors_dict = []
+    try:
+        cors = bucket.get_cors_xml()
+        cors_dict = cors_xml_to_dict(cors)
+    except S3ResponseError as e:
+        if e.error_code == "NoSuchCORSConfiguration":
+            pass
+
+    module.exit_json(   changed = changed,
+                        name = bucket.name,
+                        versioning = versioning_status,
+                        requester_pays = requester_pays_status,
+                        policy = current_policy,
+                        tags = current_tags_dict,
+                        cors = cors_dict
+    )
+
 def _destroy_bucket(connection, module):
-    
+
     force = module.params.get("force")
     name = module.params.get("name")
     changed = False
-    
+
     try:
         bucket = connection.get_bucket(name)
     except S3ResponseError as e:
@@ -285,22 +319,22 @@ def _destroy_bucket(connection, module):
         else:
             # Bucket already absent
             module.exit_json(changed=changed)
-    
+
     if force:
         try:
             # Empty the bucket
             for key in bucket.list():
                 key.delete()
-                
+
         except BotoServerError as e:
             module.fail_json(msg=e.message)
-    
+
     try:
         bucket = connection.delete_bucket(name)
         changed = True
     except S3ResponseError as e:
         module.fail_json(msg=e.message)
-        
+
     module.exit_json(changed=changed)
 
 def _create_bucket_ceph(connection, module, location):
@@ -354,27 +388,27 @@ def is_walrus(s3_url):
         return False
 
 def main():
-    
+
     argument_spec = ec2_argument_spec()
     argument_spec.update(
         dict(
             force = dict(required=False, default='no', type='bool'),
-            policy = dict(required=False, default=None),
-            name = dict(required=True),
+            policy = dict(required=False, type='str', default=None),
+            name = dict(required=True, type='str'),
             requester_pays = dict(default='no', type='bool'),
-            s3_url = dict(aliases=['S3_URL']),
-            state = dict(default='present', choices=['present', 'absent']),
+            s3_url = dict(aliases=['S3_URL'], type='str'),
+            state = dict(default='present', type='str', choices=['present', 'absent']),
             tags = dict(required=None, default={}, type='dict'),
             versioning = dict(default='no', type='bool'),
             ceph = dict(default='no', type='bool')
         )
     )
-    
+
     module = AnsibleModule(argument_spec=argument_spec)
 
     if not HAS_BOTO:
         module.fail_json(msg='boto required for this module')
-    
+
     region, ec2_url, aws_connect_params = get_aws_connection_info(module)
 
     if region in ('us-east-1', '', None):
@@ -444,5 +478,9 @@ def main():
     elif state == 'absent':
         destroy_bucket(connection, module, flavour=flavour)
 
+from ansible.module_utils.basic import *
+from ansible.module_utils.ec2 import *
+
 if __name__ == '__main__':
     main()
+

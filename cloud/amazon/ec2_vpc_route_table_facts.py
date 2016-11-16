@@ -73,13 +73,20 @@ def get_route_table_info(route_table):
     for route in route_table.routes:
         routes.append(route.__dict__)
 
+    # Add route associations too
+    route_associations = []
+    for route_association in route_table.associations:
+        route_associations.append(route_association.__dict__)
+
     route_table_info = { 'id': route_table.id,
                          'routes': routes,
                          'tags': route_table.tags,
-                         'vpc_id': route_table.vpc_id
+                         'vpc_id': route_table.vpc_id,
+                         'associations': route_associations
                        }
 
     return route_table_info
+
 
 def list_ec2_vpc_route_tables(connection, module):
 

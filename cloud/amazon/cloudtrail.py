@@ -36,23 +36,28 @@ options:
     description:
       - name for given CloudTrail configuration.
       - This is a primary key and is used to identify the configuration.
-  s3_bucket_prefix:
+  s3_bucket_name:
     description:
       - bucket to place CloudTrail in.
       - this bucket should exist and have the proper policy. See U(http://docs.aws.amazon.com/awscloudtrail/latest/userguide/aggregating_logs_regions_bucket_policy.html)
       - required when state=enabled.
     required: false
+    version_added: "2.3"
   s3_key_prefix:
     description:
       - prefix to keys in bucket. A trailing slash is not necessary and will be removed.
     required: false
+  sns_topic_name:
+    description:
+      - name for SNS topic to send notifications of log file delivery.
+    required: false
+    version_added: "2.3"
   include_global_events:
     description:
       - record API calls from global services such as IAM and STS?
     required: false
     default: false
     choices: ["true", "false"]
-
   aws_secret_key:
     description:
       - AWS secret key. If not set then the value of the AWS_SECRET_KEY environment variable is used.
@@ -73,6 +78,13 @@ options:
     required: false
     aliases: ['aws_region', 'ec2_region']
     version_added: "1.5"
+  logging:
+    description:
+      - Enables or disable CloudTrail logging
+    required: false
+    default: true
+    choices: [ "true", "false" ]
+    version_added: "2.3"
 
 extends_documentation_fragment: aws
 """
@@ -99,6 +111,13 @@ EXAMPLES = """
       state: disabled
       name: main
       region: us-east-1
+
+  - name: disable cloudtrail logging
+    cloudtrail:
+      state: enabled
+      name: main
+      s3_bucket_name: trail-bucket
+      logging: false
 """
 
 HAS_BOTO = False
@@ -148,6 +167,9 @@ class CloudTrailManager:
         '''Turn on logging for a cloudtrail that already exists. Throws Exception on error.'''
         self.conn.start_logging(name)
 
+    def stop_logging(self, name):
+        ''' Turn off logging for cloudtrail '''
+        self.conn.stop_logging(name)
 
     def enable(self, **create_args):
         return self.conn.create_trail(**create_args)
@@ -160,7 +182,6 @@ class CloudTrailManager:
         self.conn.delete_trail(name)
 
 
-
 def main():
 
     argument_spec = ec2_argument_spec()
@@ -169,7 +190,9 @@ def main():
         name={'required': True, 'type': 'str'},
         s3_bucket_name={'required': False, 'type': 'str'},
         s3_key_prefix={'default': '', 'required': False, 'type': 'str'},
+        sns_topic_name={'default': '', 'required': False, 'type': 'str'},
         include_global_events={'default': True, 'required': False, 'type': 'bool'},
+        logging={'default': True, 'required': False, 'type': 'bool'},
     ))
     required_together = (['state', 's3_bucket_name'])
 
@@ -189,8 +212,9 @@ def main():
     s3_bucket_name = module.params['s3_bucket_name']
     # remove trailing slash from the key prefix, really messes up the key structure.
     s3_key_prefix = module.params['s3_key_prefix'].rstrip('/')
-
+    sns_topic_name = module.params['sns_topic_name']
     include_global_events = module.params['include_global_events']
+    logging = module.params['logging']
 
     #if module.params['state'] == 'present' and 'ec2_elbs' not in module.params:
     #    module.fail_json(msg="ELBs are required for registration or viewing")
@@ -203,28 +227,42 @@ def main():
         if results['exists']:
             results['view'] = cf_man.view(ct_name)
             # only update if the values have changed.
-            if results['view']['S3BucketName']              != s3_bucket_name or \
-              results['view'].get('S3KeyPrefix', '')      != s3_key_prefix  or \
-              results['view']['IncludeGlobalServiceEvents'] != include_global_events:
-                if not module.check_mode:
-                    results['update'] = cf_man.update(name=ct_name, s3_bucket_name=s3_bucket_name, s3_key_prefix=s3_key_prefix, include_global_service_events=include_global_events)
-                results['changed'] = True
+            if results['view']['S3BucketName']               != s3_bucket_name or \
+               results['view'].get('S3KeyPrefix', '')        != s3_key_prefix or \
+               results['view'].get('SnsTopicName', '')       != sns_topic_name or \
+               results['view']['IncludeGlobalServiceEvents'] != include_global_events:
+                   if not module.check_mode:
+                       results['update'] = cf_man.update(name=ct_name,
+                                                         s3_bucket_name=s3_bucket_name,
+                                                         s3_key_prefix=s3_key_prefix,
+                                                         sns_topic_name=sns_topic_name,
+                                                         include_global_service_events=include_global_events)
+                   results['changed'] = True
         else:
             if not module.check_mode:
                 # doesn't exist. create it.
-                results['enable'] = cf_man.enable(name=ct_name, s3_bucket_name=s3_bucket_name, s3_key_prefix=s3_key_prefix, include_global_service_events=include_global_events)
+                results['enable'] = cf_man.enable(name=ct_name,
+                                                  s3_bucket_name=s3_bucket_name,
+                                                  s3_key_prefix=s3_key_prefix,
+                                                  sns_topic_name=sns_topic_name,
+                                                  include_global_service_events=include_global_events)
             results['changed'] = True
 
-        # given cloudtrail should exist now. Enable the logging.
+        # given cloudtrail should exist now. Enable the logging if required.
         results['view_status'] = cf_man.view_status(ct_name)
         results['was_logging_enabled'] = results['view_status'].get('IsLogging', False)
-        if not results['was_logging_enabled']:
+        if not results['was_logging_enabled'] and logging:
             if not module.check_mode:
                 cf_man.enable_logging(ct_name)
                 results['logging_enabled'] = True
             results['changed'] = True
+        elif results['was_logging_enabled'] and not logging:
+            if not module.check_mode:
+                cf_man.stop_logging(ct_name)
+                results['logging_enabled'] = False
+            results['changed'] = True
 
-    # delete the cloudtrai
+    # delete the cloudtrail
     elif module.params['state'] == 'disabled':
         # check to see if it exists before deleting.
         results['exists'] = cf_man.exists(name=ct_name)
